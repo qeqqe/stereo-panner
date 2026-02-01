@@ -30,11 +30,17 @@ const RADIUS_STEP: f64 = 0.1;
 const MIN_REVERB: f64 = 0.05;  // closest
 const MAX_REVERB: f64 = 0.60;  // farthest
 
-// speaker angles for front and back modes
-const FRONT_LEFT_ANGLE: f64 = 30.0;   // +30° (front-left)
-const FRONT_RIGHT_ANGLE: f64 = -30.0; // -30° (front-right)
-const BACK_LEFT_ANGLE: f64 = 150.0;   // +150° (back-left)
-const BACK_RIGHT_ANGLE: f64 = -150.0; // -150° (back-right)
+// speaker angles for front and back modes (base angles at 100% width)
+const FRONT_LEFT_ANGLE: f64 = 45.0;   // +45° (front-left) - wider for less focus
+const FRONT_RIGHT_ANGLE: f64 = -45.0; // -45° (front-right)
+const BACK_LEFT_ANGLE: f64 = 135.0;   // +135° (back-left)
+const BACK_RIGHT_ANGLE: f64 = -135.0; // -135° (back-right)
+
+// stereo width control: adjusts speaker separation
+const DEFAULT_WIDTH: f64 = 1.0;  // 100% = full separation
+const MIN_WIDTH: f64 = 0.3;      // 30% = narrow (more focused)
+const MAX_WIDTH: f64 = 1.5;      // 150% = extra wide (very diffuse)
+const WIDTH_STEP: f64 = 0.1;
 
 // node name to search for in pipewire
 const SPATIALIZER_NODE_NAME: &str = "effect_input.spatializer";
@@ -59,8 +65,8 @@ impl SpeakerMode {
 
     fn base_angles(&self) -> (f64, f64) {
         match self {
-            SpeakerMode::Front => (FRONT_LEFT_ANGLE, FRONT_RIGHT_ANGLE),
-            SpeakerMode::Back => (BACK_LEFT_ANGLE, BACK_RIGHT_ANGLE),
+            SpeakerMode::Front => (BACK_LEFT_ANGLE, BACK_RIGHT_ANGLE),
+            SpeakerMode::Back => (FRONT_LEFT_ANGLE, FRONT_RIGHT_ANGLE),
         }
     }
 }
@@ -76,7 +82,7 @@ impl SmoothedState {
         Self { yaw: 0.0, pitch: 0.0, roll: 0.0 }
     }
 
-        // apply exponential smoothing: smoothed = α * previous + (1 - α) * current
+    // apply exponential smoothing
     fn update(&mut self, raw_yaw: f64, raw_pitch: f64, raw_roll: f64) {
         self.yaw = SMOOTHING_FACTOR * self.yaw + (1.0 - SMOOTHING_FACTOR) * raw_yaw;
         self.pitch = SMOOTHING_FACTOR * self.pitch + (1.0 - SMOOTHING_FACTOR) * raw_pitch;
@@ -95,13 +101,17 @@ struct SpatialState {
 }
 
 impl SpatialState {
-    fn from_head_tracking(yaw: f64, pitch: f64, radius: f64, mode: SpeakerMode, reverb_enabled: bool) -> Self {
+    fn from_head_tracking(yaw: f64, pitch: f64, radius: f64, mode: SpeakerMode, reverb_enabled: bool, width: f64) -> Self {
         // get base speaker angles based on mode
         let (left_base, right_base) = mode.base_angles();
 
+        // width > 1.0 = wider (diffused), width < 1.0 = narrower (focused)
+        let left_base_scaled = left_base * width;
+        let right_base_scaled = right_base * width;
+
         // relative azimuth = base_pos - head_yaw
-        let left_az = left_base - yaw;
-        let right_az = right_base - yaw;
+        let left_az = left_base_scaled - yaw;
+        let right_az = right_base_scaled - yaw;
 
         // pitch is inverted (looking up moves the source down relative to eyes)
         let elevation = -pitch;
@@ -155,7 +165,7 @@ fn get_visible_width(s: &str) -> usize {
         }
         // account for double-width emojis used in headers
         match c {
-            '🎧' | '📊' | '🔊' | '📈' | '📡' => width += 2,
+             '🎧' | '🧭' | '🔊' | '📐' |  '📡' | '📈'  => width += 2,
             _ => width += 1,
         }
     }
@@ -211,6 +221,7 @@ fn render_dashboard(
     packets: u64,
     mode: SpeakerMode,
     reverb_enabled: bool,
+    width: f64,
 ) {
     clear_screen();
 
@@ -235,7 +246,7 @@ fn render_dashboard(
     print!("\x1B[1;96m║\x1B[0m{}{}{}\x1B[1;96m║\x1B[0m\r\n", " ".repeat(t_pad), title, " ".repeat(66 - t_vis - t_pad));
     print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
 
-    draw_row(&format!("  {}", "\x1B[1;33m📊 HEAD TRACKING\x1B[0m"));
+    draw_row(&format!("  {}", "\x1B[1;33m🧭 HEAD TRACKING\x1B[0m"));
     draw_row("");
     draw_row(&format!("    \x1B[90mRAW:\x1B[0m     Yaw={:>7.1}°  Pitch={:>7.1}°  Roll={:>7.1}°",
                       raw_yaw, raw_pitch, raw_roll));
@@ -252,11 +263,28 @@ fn render_dashboard(
     draw_row(&format!("  \x1B[1;35m🔊 VIRTUAL SPEAKERS\x1B[0m  [{}{}°\x1B[0m]", mode_color, mode.label()));
     draw_row("");
 
-    let l_bar = render_azimuth_bar(spatial.left_az, 24);
-    draw_row(&format!("    \x1B[1;36mLeft Speaker:\x1B[0m  {}  {:>+6.1}°", l_bar, spatial.left_az));
+    let adjust_display_azimuth = |a: f64| -> f64 {
+        let mut x = a;
+        // normalize to -180..180
+        while x <= -180.0 { x += 360.0; }
+        while x > 180.0 { x -= 360.0; }
+        // so it doesnt clamp to the end
+        if x > 90.0 {
+            x -= 180.0;
+        } else if x < -90.0 {
+            x += 180.0;
+        }
+        x
+    };
 
-    let r_bar = render_azimuth_bar(spatial.right_az, 24);
-    draw_row(&format!("    \x1B[1;35mRight Speaker:\x1B[0m {}  {:>+6.1}°", r_bar, spatial.right_az));
+    let left_display = adjust_display_azimuth(spatial.right_az);
+    let right_display = adjust_display_azimuth(spatial.left_az);
+
+    let l_bar = render_azimuth_bar(left_display, 24);
+    draw_row(&format!("    \x1B[1;34mLeft Speaker:\x1B[0m  {}  {:>+6.1}°", l_bar, left_display));
+
+    let r_bar = render_azimuth_bar(right_display, 24);
+    draw_row(&format!("    \x1B[1;35mRight Speaker:\x1B[0m {}  {:>+6.1}°", r_bar, right_display));
 
     draw_row("");
 
@@ -269,6 +297,25 @@ fn render_dashboard(
     let reverb_pct = spatial.reverb_gain * 100.0;
     let reverb_status = if reverb_enabled { "\x1B[1;32mON\x1B[0m" } else { "\x1B[1;31mOFF\x1B[0m" };
     draw_row(&format!("    \x1B[1;37mReverb:\x1B[0m   {:>6.1}%  [{}]", reverb_pct, reverb_status));
+
+    draw_row("");
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
+
+    draw_row(&format!("  {}", "\x1B[1;33m📐 STEREO FIELD\x1B[0m"));
+    draw_row("");
+
+    let width_pct = width * 100.0;
+    let width_desc = if width >= 1.2 {
+        "\x1B[1;36mVery Wide\x1B[0m"
+    } else if width >= 0.8 {
+        "\x1B[1;37mNormal\x1B[0m"
+    } else {
+        "\x1B[1;33mNarrow\x1B[0m"
+    };
+    draw_row(&format!("    \x1B[1;37mWidth:\x1B[0m    {:>6.0}%  ({})", width_pct, width_desc));
+
+    let sep_angle = (spatial.left_az - spatial.right_az).abs();
+    draw_row(&format!("    \x1B[1;37mSeparation:\x1B[0m {:>5.1}°  (speaker spread)", sep_angle));
 
     draw_row("");
     print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
@@ -305,7 +352,8 @@ fn render_dashboard(
     print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
 
     draw_row(&format!("  {}", "\x1B[1;90m⌨ CONTROLS\x1B[0m"));
-    draw_row("    \x1B[90m↑/↓\x1B[0m Radius   \x1B[90mW\x1B[0m Front   \x1B[90mS\x1B[0m Back   \x1B[90mR\x1B[0m Reverb   \x1B[90mQ/Esc\x1B[0m Quit");
+    draw_row("    \x1B[90m↑/↓\x1B[0m Radius   \x1B[90m←/→\x1B[0m Width   \x1B[90mW\x1B[0m Front   \x1B[90mS\x1B[0m Back");
+    draw_row("    \x1B[90mR\x1B[0m Reverb   \x1B[90mQ/Esc\x1B[0m Quit");
     print!("\x1B[1;96m╚══════════════════════════════════════════════════════════════════╝\x1B[0m\r\n");
 }
 
@@ -453,10 +501,11 @@ fn run_main_loop() -> Result<(), String> {
     // raw values for display (set on first packet)
     let (mut raw_yaw, mut raw_pitch, mut raw_roll): (f64, f64, f64);
 
-    // dynamic state: radius and speaker mode
+    // dynamic state: radius, speaker mode, and width
     let mut current_radius: f64 = DEFAULT_RADIUS;
     let mut speaker_mode: SpeakerMode = SpeakerMode::Front;
     let mut reverb_enabled: bool = false; // off by default
+    let mut current_width: f64 = DEFAULT_WIDTH;
 
     // flag to force update when user changes settings
     let mut force_update = false;
@@ -465,7 +514,7 @@ fn run_main_loop() -> Result<(), String> {
         // 1. handle keyboard input (non-blocking)
         if event::poll(Duration::from_secs(0)).unwrap_or(false) {
             if let Ok(Event::Key(key_event)) = event::read() {
-                match handle_key_event(key_event, &mut current_radius, &mut speaker_mode, &mut reverb_enabled) {
+                match handle_key_event(key_event, &mut current_radius, &mut speaker_mode, &mut reverb_enabled, &mut current_width) {
                     KeyAction::Quit => break,
                     KeyAction::Changed => {
                         force_update = true;
@@ -500,13 +549,14 @@ fn run_main_loop() -> Result<(), String> {
                     continue;
                 }
 
-                // calculate spatial positions with current radius and mode
+                // calculate spatial positions with current radius, mode, and width
                 let spatial = SpatialState::from_head_tracking(
                     smoothed.yaw,
                     smoothed.pitch,
                     current_radius,
                     speaker_mode,
                     reverb_enabled,
+                    current_width,
                 );
 
                 // 5. send to pipewire (only if changed enough to avoid spamming, or forced)
@@ -556,6 +606,7 @@ fn run_main_loop() -> Result<(), String> {
                     packet_count,
                     speaker_mode,
                     reverb_enabled,
+                    current_width,
                 );
                 stdout().flush().ok();
 
@@ -591,6 +642,7 @@ fn handle_key_event(
     radius: &mut f64,
     mode: &mut SpeakerMode,
     reverb_enabled: &mut bool,
+    width: &mut f64,
 ) -> KeyAction {
     match key.code {
         // quit keys
@@ -604,6 +656,16 @@ fn handle_key_event(
         }
         KeyCode::Down => {
             *radius = (*radius - RADIUS_STEP).max(MIN_RADIUS);
+            KeyAction::Changed
+        }
+
+        // width control: left/right arrows
+        KeyCode::Right => {
+            *width = (*width + WIDTH_STEP).min(MAX_WIDTH);
+            KeyAction::Changed
+        }
+        KeyCode::Left => {
+            *width = (*width - WIDTH_STEP).max(MIN_WIDTH);
             KeyAction::Changed
         }
 
